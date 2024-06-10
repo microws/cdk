@@ -23,7 +23,6 @@ import {
   ListenerCondition,
 } from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import { Duration, Fn, Tags, aws_kinesis } from "aws-cdk-lib";
-import { Certificate } from "aws-cdk-lib/aws-certificatemanager";
 import {
   AwsLogDriverMode,
   Cluster,
@@ -41,6 +40,10 @@ import { RetentionDays } from "aws-cdk-lib/aws-logs";
 import { Archive, EventBus } from "aws-cdk-lib/aws-events";
 
 type Env = "dev" | "prod";
+/**
+ *
+ * @deprecated Please use the MicrowsAccount Construct instead
+ */
 export function MicrowsAWSAccount(
   scope: Construct & {
     account: string;
@@ -59,7 +62,6 @@ export function MicrowsAWSAccount(
      */
     publicWebServers?: boolean;
     env: Env;
-    certificateArn: string;
   },
 ) {
   const ipMap = {
@@ -134,14 +136,6 @@ export function MicrowsAWSAccount(
     }),
   });
 
-  const listener = loadBalancer.addListener("Listener", {
-    port: 443,
-    certificates: [Certificate.fromCertificateArn(scope, "Certificate", params.certificateArn)],
-    defaultAction: ListenerAction.fixedResponse(500, {
-      contentType: "text/html",
-      messageBody: "Error",
-    }),
-  });
   const bus = new EventBus(scope, "Bus", {
     eventBusName: "Microws" + env,
   });
@@ -209,6 +203,160 @@ export function MicrowsAWSAccount(
     });
   }
   return { vpc };
+}
+
+export class MicrowsAccount extends Construct {
+  constructor(
+    scope: Construct,
+    id: string,
+    props: {
+      ipAddress?: IIpAddresses;
+      publicWebServers?: boolean;
+      account: string;
+      env: "dev" | "prod" | string;
+    },
+  ) {
+    super(scope, id);
+    const ipMap = {
+      dev: `10.0.0.2/16`,
+      stage: `10.0.0.1/16`,
+      prod: `10.0.0.0/16`,
+    };
+    const { ipAddress, publicWebServers, env } = {
+      ipAddress: IpAddresses.cidr(ipMap[props.env]),
+      publicWebServers: false,
+      ...props,
+    };
+
+    const vpc = new Vpc(this, "VPC", {
+      ipAddresses: ipAddress,
+      vpcName: `/microws/${env}`,
+      maxAzs: 3,
+      enableDnsHostnames: true,
+      enableDnsSupport: true,
+      gatewayEndpoints: publicWebServers
+        ? {}
+        : {
+            S3: {
+              service: GatewayVpcEndpointAwsService.S3,
+              subnets: [{ subnetGroupName: "Application" }],
+            },
+            DynamoDB: {
+              service: GatewayVpcEndpointAwsService.DYNAMODB,
+              subnets: [{ subnetGroupName: "Application" }],
+            },
+          },
+      //Just put them in public for now
+      natGateways: publicWebServers ? 0 : 1,
+      natGatewaySubnets: { subnetGroupName: "Public" },
+      subnetConfiguration: [
+        {
+          name: "Public",
+          cidrMask: 23,
+          subnetType: SubnetType.PUBLIC,
+        },
+        {
+          name: "Application",
+          cidrMask: 23,
+          subnetType: publicWebServers ? SubnetType.PUBLIC : SubnetType.PRIVATE_WITH_EGRESS,
+          // subnetType: SubnetType.PRIVATE_WITH_EGRESS,
+        },
+      ],
+    });
+    const securityGroup = new SecurityGroup(this, "SecurityGroup", {
+      vpc: vpc,
+      description: "security group for Load Balancer",
+      securityGroupName: "LBSecurityGroup",
+      allowAllOutbound: false,
+    });
+    securityGroup.addEgressRule(Peer.anyIpv4(), Port.tcp(443), "Allow outbound HTTPS");
+    securityGroup.addEgressRule(Peer.anyIpv6(), Port.tcp(443), "Allow outbound HTTPS");
+
+    const loadBalancer = new ApplicationLoadBalancer(this, "ALB", {
+      vpc,
+      internetFacing: true,
+      securityGroup,
+      idleTimeout: Duration.seconds(180),
+      vpcSubnets: { subnetGroupName: "Public" },
+    });
+    //@ts-ignore
+    Tags.of(loadBalancer).add("microws", this.account);
+    Tags.of(loadBalancer).add("env", env);
+    loadBalancer.addListener("Redirect", {
+      port: 80,
+      defaultAction: ListenerAction.redirect({
+        port: "443",
+        protocol: ApplicationProtocol.HTTPS,
+      }),
+    });
+
+    const bus = new EventBus(this, "Bus", {
+      eventBusName: "Microws" + env,
+    });
+    const archive = new Archive(this, `Microws${env.toUpperCase()}Archive`, {
+      eventPattern: {
+        source: [
+          //@ts-ignore
+          {
+            prefix: "",
+          },
+        ],
+      },
+      sourceEventBus: bus,
+      retention: Duration.days(7),
+    });
+    const amazonEventBus = EventBus.fromEventBusName(this, "AWSEventBus", "default");
+
+    //IPV6
+    const ipv6CfnCidrBlock = new CfnVPCCidrBlock(this, "Ipv6CfnCidrBlock", {
+      vpcId: vpc.vpcId,
+      amazonProvidedIpv6CidrBlock: true,
+    });
+    const ipv6CidrBlock = Fn.select(0, vpc.vpcIpv6CidrBlocks);
+    const ipv6SubnetCidrBlocks = Fn.cidr(ipv6CidrBlock, 256, "64");
+    [...vpc.publicSubnets, ...vpc.privateSubnets, ...vpc.isolatedSubnets].forEach((subnet, index) => {
+      const cfnSubnet = subnet.node.defaultChild as CfnSubnet;
+      // Assign the ipv6 cidr block to the subnet
+      cfnSubnet.ipv6CidrBlock = Fn.select(index, ipv6SubnetCidrBlocks);
+      // Enable auto assignment of ipv6 addresses
+      cfnSubnet.assignIpv6AddressOnCreation = true;
+      // Explicitly disable auto assignment of ipv4 addresses
+      cfnSubnet.mapPublicIpOnLaunch = false;
+      // Enable DNS64 for the subnet to allow ipv6-only clients to access ipv4 resources
+      cfnSubnet.enableDns64 = true;
+      // Do not create DNS records for instances on launch - downstream services will create DNS records
+      cfnSubnet.privateDnsNameOptionsOnLaunch = {
+        EnableResourceNameDnsAAAARecord: false,
+        EnableResourceNameDnsARecord: false,
+      };
+      // Add dependency on the ipv6 cidr block
+      cfnSubnet.node.addDependency(ipv6CfnCidrBlock);
+      // Add ipv6 cidr block to the map
+      // ipv6CidrBlockBySubnet[cfnSubnet.attrSubnetId] = Fn.select(index, ipv6SubnetCidrBlocks);
+    });
+    if (vpc.privateSubnets.length > 0) {
+      // Create egress only internet gateway
+      const egressOnlyInternetGateway = new CfnEgressOnlyInternetGateway(this, "EgressOnlyInternetGateway", {
+        vpcId: vpc.vpcId,
+      });
+      const egressOnlyInternetGatewayId = egressOnlyInternetGateway.ref;
+      // Add Route for IPV6 in Private Subnets - Egress only internet gateway
+      vpc.privateSubnets.forEach((subnet) => {
+        (subnet as Subnet).addRoute("ipv6EgressRoute", {
+          routerType: RouterType.EGRESS_ONLY_INTERNET_GATEWAY,
+          routerId: egressOnlyInternetGatewayId!,
+          destinationIpv6CidrBlock: "::/0",
+          enablesInternetConnectivity: true,
+        });
+        // // Add route fpr DNS64 to allow ipv6-only clients to access ipv4 resources through NAT Translation
+        // (subnet as Subnet).addRoute('ipv6Nat64Route', {
+        //   routerType: RouterType.NAT_GATEWAY,
+        //   routerId: natgatewayId,
+        //   destinationIpv6CidrBlock: '64:ff9b::/96',
+        // });
+      });
+    }
+  }
 }
 
 export function MicrowsService(

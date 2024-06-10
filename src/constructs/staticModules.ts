@@ -63,16 +63,8 @@ export function MicrowsStatic(scope: Construct, props: MicrowsStaticProps) {
     },
   });
 
-  let bucket = new Bucket(scope, "MicrowsStaticBucket", {});
-  let table = MicrowsDynamoDBTable(scope, "MicrowsStaticTable", {
-    autoIndexes: 5,
-    gsiIndexes: 3,
-    headerIndex: true,
-    projIndexes: 2,
-  });
-
-  new Bucket(scope, `${props.name}StaticBucket`, {});
-  MicrowsDynamoDBTable(scope, `${props.name}StaticTable`, {
+  let bucket = new Bucket(scope, `${props.name}StaticBucket`, {});
+  let table = MicrowsDynamoDBTable(scope, `${props.name}StaticTable`, {
     autoIndexes: 5,
     gsiIndexes: 3,
     headerIndex: true,
